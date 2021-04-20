@@ -1,0 +1,41 @@
+# Configuration for Presence detection
+
+# MQTT broker settings
+mqtt:
+  broker: 127.0.0.1
+  port: 1883
+  username: yourusername
+  password: yourpassword
+
+# Devices that you want to track, eg Apple Watch or BLE beacon
+devices:
+  - id: my_apple_watch
+    name: My Apple Watch
+
+# Sensors the provide RSSI tracking, typically ESP32's or Raspberry Pi's
+sensors:
+  - lounge1
+  - lounge2
+  - mainbedroom
+
+# This service subscribes to MQTT topics: for each device on each sensor
+# Topics subscribed to will be in the format `{sensor_id}/sensor/{device_id}/rssi`
+# For example `lounge1/sensor/my_apple_watch/rssi` `lounge2/sensor/my_apple_watch/rssi` `mainbedroom/sensor/my_apple_watch/rssi`
+# This is the same format that ESPHome uses
+
+# Whether to publish autodiscovery messages to home assistant
+homeassistant:
+  topic: homeassistant  # MQTT Autodiscovery root topic
+  device_tracker: true  # Publish autodiscovery for home/not_home messages
+  sensor: true  # Publish autodiscovery for current location sensor
+
+# Database to store RSSI readings in, for later use in training machine learning models
+database: rssi.sqlite
+
+# k-nearest neighbours clustering algorithm settings
+knn:
+  neighbours: 7  # Use n closest neighbours to determine which cluster a reading belongs to
+  min_confidence: 0.8  # Only assume you are in this new location if more than 80% of confident
+
+debounce_length: 3  # Only assume changed rooms if 2 subsequent readings agree
+
