@@ -11,7 +11,9 @@ from datetime import datetime
 from json import dumps
 
 import paho.mqtt.client as mqtt
+import pandas as pd
 import yaml
+from sklearn.svm import SVC
 
 SERVICE_NAME = "presence-ml"
 
@@ -47,7 +49,6 @@ default_config = {
 }
 
 config = {**default_config, **config}
-print(config)
 
 
 class Debounce:
@@ -94,7 +95,6 @@ class DeviceTracker:
 
 def mqtt_on_connect(client, userdata, flags, rc):
     """Renew subscriptions and set Last Will message when we connect to broker."""
-    print(f"Connected with result code {rc}")
     # Set up Last Will, and then set our status to 'online'
     client.will_set(f"{SERVICE_NAME}/status", payload="offline", qos=1, retain=True)
     client.publish(f"{SERVICE_NAME}/status", payload="online", qos=1, retain=True)
@@ -105,7 +105,6 @@ def mqtt_on_connect(client, userdata, flags, rc):
         for sensor_id in config["sensors"]:
             sensor_topics.append((f"{sensor_id}/sensor/{device_id}_rssi/state", 0))
         client.subscribe(sensor_topics)
-        print(sensor_topics)
 
         # Home Assistant MQTT autoconfig
         if config["homeassistant"]["sensor"]:
@@ -199,9 +198,10 @@ def materialise_rssi_aggregation():
         CREATE TABLE rssi_agg AS SELECT homepi,
                                         upylounge,
                                         upybedroom,
-                                        location,
+                                        batch.location,
                                         count( * ) weight
                                   FROM rssi
+                                  join batch on batch.id = rssi.batch_id
                                   GROUP BY homepi,
                                            upylounge,
                                            upybedroom,
@@ -219,7 +219,7 @@ def knn(neighbours):
     cur.execute(
         """
           SELECT location,
-                 sum(weight) AS total_weight
+                 sum(1.0*weight/dist) AS total_weight
           FROM (SELECT ( ( ? - upybedroom) * ( ? - upybedroom) +
                          ( ? - upylounge) * ( ? - upylounge) +
                          ( ? - homepi) * ( ? - homepi) ) AS dist,
@@ -254,6 +254,42 @@ def knn(neighbours):
         return location, weight / total_weight
     else:
         return None, None
+
+
+def load_data():
+    # TODO generalise
+    con = sqlite3.connect("rssi.sqlite")
+    df = pd.read_sql_query(
+        """select homepi, upylounge, upybedroom, batch.location
+           from rssi
+           join batch on rssi.batch_id = batch.id
+           where homepi is not null and upylounge is not null and upybedroom is not null
+                 and batch.is_enabled = 1""",
+        con,
+    )
+    X = df[["homepi", "upylounge", "upybedroom"]]
+    y = df["location"]
+    return X, y
+
+
+class SVM:
+    def __init__(self, rssis, locations):
+        self.svm = SVC(kernel="linear", C=0.25, random_state=1, probability=True)
+        self.svm.fit(rssis, locations)
+        self.unique_locations = sorted(set(locations))
+
+    def predict(self, rssi):
+        if None in rssi:
+            return None, None
+        location = self.svm.predict([rssi])[0]
+        probability = self.svm.predict_proba([rssi])[
+            0
+        ]  # list of probabilities for all locations
+        index = self.unique_locations.index(
+            location
+        )  # find probability for predicted location
+        probability = probability[index]
+        return location, probability
 
 
 def on_exit(signum, frame):
@@ -292,11 +328,21 @@ def background_timer():
             )
 
         # Predict location
-        location, confidence = knn(config["knn"]["neighbours"])
+        # location, confidence = knn(config["knn"]["neighbours"])
+        rssi = [
+            results["homepi"]["rssi"],
+            results["upylounge"]["rssi"],
+            results["upybedroom"]["rssi"],
+        ]
+        location, confidence = svm_predictor.predict(rssi)
+
         if location:
-            print(f"In {location}, {int(confidence*100)}%, {room_debounce._history}")
+            print(
+                f"{location}: {int(confidence*100)}% ->",
+            )
             if confidence > config["knn"]["min_confidence"]:
                 location, has_changed = room_debounce.vote(location)
+                print(f"{room_debounce._history} -> {location}")
                 # TODO unsure whether should publish if there is no location or not...
                 if location and has_changed:
                     # TODO remove hardcoded device ID
@@ -331,6 +377,9 @@ results = {
 
 room_debounce = Debounce(length=config["debounce_length"])
 device_tracker = DeviceTracker()
+
+X, y = load_data()
+svm_predictor = SVM(X, y)
 
 if __name__ == "__main__":
     materialise_rssi_aggregation()

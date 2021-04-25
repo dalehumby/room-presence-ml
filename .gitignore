@@ -125,4 +125,5 @@ dmypy.json
 .pyre/
 *.sqlite
 config.yaml
-*.backup
+*.backup?
+.DS_Store

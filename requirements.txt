@@ -1,2 +1,4 @@
 paho-mqtt
 pyyaml
+pandas
+scikit-learn
