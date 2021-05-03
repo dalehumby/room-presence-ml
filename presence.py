@@ -3,23 +3,21 @@ Record events from MQTT to SQLite DB
 """
 
 import argparse
+import re
 import signal
-import sqlite3
 import sys
 import threading
 from datetime import datetime
 from json import dumps
 
 import paho.mqtt.client as mqtt
-import pandas as pd
 import yaml
-from sklearn.svm import SVC
 
 SERVICE_NAME = "presence-ml"
+RSSI_STALE_TIMEOUT = 10
+mqtt_rssi_topic = re.compile(r"(\w+)\/sensor\/(\w+)_rssi\/state")
 
-parser = argparse.ArgumentParser(
-    description="Presence detection using k-nearest neighbours"
-)
+parser = argparse.ArgumentParser(description="Presence detection")
 parser.add_argument(
     "-c",
     "--config",
@@ -27,28 +25,7 @@ parser.add_argument(
     help="Configuration yaml file, defaults to `config.yaml`",
     dest="config_file",
 )
-parser.add_argument(
-    "-t",
-    "--train",
-    help="Train the model by recording signal strength by moving around your current LOCATION",
-    dest="location",
-)
 args = parser.parse_args()
-
-with open(args.config_file, "r") as f:
-    config = yaml.safe_load(f)
-
-default_config = {
-    "mqtt": {"broker": "127.0.0.1", "port": 1883, "username": None, "password": None},
-    "devices": [],
-    "sensors": [],
-    "homeassistant": {"topic": "homeassistant", "device_tracker": True, "sensor": True},
-    "database": "rssi.sqlite",
-    "knn": {"neighbours": 7, "min_confidence": 0.8},
-    "debounce_length": 3,
-}
-
-config = {**default_config, **config}
 
 
 class Debounce:
@@ -77,15 +54,23 @@ class Debounce:
 
 
 class DeviceTracker:
-    def __init__(self):
-        self._debounce = Debounce()
-        self.home_state = "not_home"
+    """Home Assistant Device Tracker for home/not_home detection."""
 
-    def update(self, rssi_results):
-        """If any of the stations have a valid RSSI value then the devie is home."""
+    def __init__(self, device_id):
+        self.device_id = device_id
+        self.home_state = "not_home"
+        self._debounce = Debounce()
+
+    def update(self, rssi_sensors):
+        """
+        Update the devices home/not_home status.
+
+        If any of the sensors have a valid RSSI value then the devie is home,
+        otherwise it is not_home.
+        """
         is_home = False
-        for station in rssi_results.values():
-            if station["rssi"]:
+        for sensor in rssi_sensors.values():
+            if sensor["rssi"]:
                 is_home = True
                 break
         is_home, has_changed = self._debounce.vote(is_home)
@@ -93,16 +78,42 @@ class DeviceTracker:
         return self.home_state, has_changed
 
 
+def load_config(config_file):
+    """Load the configuration from config yaml file and use it to override the defaults."""
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    default_config = {
+        "mqtt": {
+            "broker": "127.0.0.1",
+            "port": 1883,
+            "username": None,
+            "password": None,
+        },
+        "devices": [],
+        "sensors": [],
+        "homeassistant": {
+            "topic": "homeassistant",
+            "device_tracker": True,
+            "sensor": True,
+        },
+        "debounce_length": 3,
+        "hysteresis": 5,
+    }
+
+    config = {**default_config, **config}
+    return config
+
+
 def mqtt_on_connect(client, userdata, flags, rc):
     """Renew subscriptions and set Last Will message when we connect to broker."""
-    # Set up Last Will, and then set our status to 'online'
+    # Set up Last Will, and then set status to 'online'
     client.will_set(f"{SERVICE_NAME}/status", payload="offline", qos=1, retain=True)
     client.publish(f"{SERVICE_NAME}/status", payload="online", qos=1, retain=True)
 
-    for device in config["devices"]:
-        device_id = device["id"]
+    for device_id, device in state.items():
         sensor_topics = []
-        for sensor_id in config["sensors"]:
+        for sensor_id in device["sensors"]:
             sensor_topics.append((f"{sensor_id}/sensor/{device_id}_rssi/state", 0))
         client.subscribe(sensor_topics)
 
@@ -163,227 +174,150 @@ def mqtt_on_connect(client, userdata, flags, rc):
 
 
 def mqtt_on_message(client, userdata, msg):
-    """The callback for when a PUBLISH message is received from the server."""
-    global results
-    station = msg.topic.split("/")[0]
-    rssi = int(msg.payload)
-    results[station]["rssi"] = rssi
-    results[station]["time"] = datetime.utcnow()
+    """
+    Handle incomming MQTT messages.
 
-
-def save_results(location):
-    """Save latest results in to the DB."""
-    conn = sqlite3.connect(config["database"])
-    conn.execute(
-        "INSERT INTO rssi (homepi, upylounge, upybedroom, location) VALUES (?, ?, ?, ?)",
-        (
-            results["homepi"]["rssi"],
-            results["upylounge"]["rssi"],
-            results["upybedroom"]["rssi"],
-            location,
-        ),
-    )
-    conn.commit()
-    conn.close()
-    print(f"Saving to --> {location}")
-
-
-def materialise_rssi_aggregation():
-    """Take the raw results and group them in to a table for faster querying."""
-    conn = sqlite3.connect(config["database"])
-    cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS rssi_agg;")
-    cur.execute(
-        """
-        CREATE TABLE rssi_agg AS SELECT homepi,
-                                        upylounge,
-                                        upybedroom,
-                                        batch.location,
-                                        count( * ) weight
-                                  FROM rssi
-                                  join batch on batch.id = rssi.batch_id
-                                  GROUP BY homepi,
-                                           upylounge,
-                                           upybedroom,
-                                           location;
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def knn(neighbours):
-    """Run k-nearest neighbours on the dataset."""
-    conn = sqlite3.connect(config["database"])
-    cur = conn.cursor()
-    cur.execute(
-        """
-          SELECT location,
-                 sum(1.0*weight/dist) AS total_weight
-          FROM (SELECT ( ( ? - upybedroom) * ( ? - upybedroom) +
-                         ( ? - upylounge) * ( ? - upylounge) +
-                         ( ? - homepi) * ( ? - homepi) ) AS dist,
-                       location,
-                       weight
-                 FROM rssi_agg
-                 WHERE dist IS NOT NULL
-                 ORDER BY dist ASC
-                 LIMIT ?)
-          GROUP BY location
-          ORDER BY total_weight DESC, location ASC;
-        """,
-        (
-            results["upybedroom"]["rssi"],
-            results["upybedroom"]["rssi"],
-            results["upylounge"]["rssi"],
-            results["upylounge"]["rssi"],
-            results["homepi"]["rssi"],
-            results["homepi"]["rssi"],
-            neighbours,
-        ),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    if rows and rows[0][0]:
-        location = rows[0][0]
-        weight = rows[0][1]
-        total_weight = 0
-        for row in rows:
-            print(f"Room: {row[0]}, Weight: {row[1]}")
-            total_weight += row[1]
-        return location, weight / total_weight
-    else:
-        return None, None
-
-
-def load_data():
-    # TODO generalise
-    con = sqlite3.connect("rssi.sqlite")
-    df = pd.read_sql_query(
-        """select homepi, upylounge, upybedroom, batch.location
-           from rssi
-           join batch on rssi.batch_id = batch.id
-           where homepi is not null and upylounge is not null and upybedroom is not null
-                 and batch.is_enabled = 1""",
-        con,
-    )
-    X = df[["homepi", "upylounge", "upybedroom"]]
-    y = df["location"]
-    return X, y
-
-
-class SVM:
-    def __init__(self, rssis, locations):
-        self.svm = SVC(kernel="linear", C=0.25, random_state=1, probability=True)
-        self.svm.fit(rssis, locations)
-        self.unique_locations = sorted(set(locations))
-
-    def predict(self, rssi):
-        if None in rssi:
-            return None, None
-        location = self.svm.predict([rssi])[0]
-        probability = self.svm.predict_proba([rssi])[
-            0
-        ]  # list of probabilities for all locations
-        index = self.unique_locations.index(
-            location
-        )  # find probability for predicted location
-        probability = probability[index]
-        return location, probability
+    Match against the rssi sensor topic, and update latest rssi values for the sensor.
+    """
+    global state
+    topic_match = mqtt_rssi_topic.match(msg.topic)
+    if topic_match:
+        sensor_id = topic_match[1]
+        device_id = topic_match[2]
+        state[device_id]["sensors"][sensor_id]["rssi"] = int(msg.payload)
+        state[device_id]["sensors"][sensor_id]["time"] = datetime.utcnow()
 
 
 def on_exit(signum, frame):
-    """Called when program exit is received."""
+    """
+    Update MQTT status to `offline`
+
+    Called when program exit is received.
+    """
     print("Exiting...")
-    client.publish("presence-ml/status", payload="offline", qos=1, retain=True)
+    client.publish(f"{SERVICE_NAME}/status", payload="offline", qos=1, retain=True)
     sys.exit(0)
 
 
-def background_timer():
-    """Loop timer for recording or predicting"""
-    global results
-    global room_debounce
-    threading.Timer(0.5, background_timer).start()
-    print(results)
-    # Remove stale data
-    for station in results:
-        if (
-            results[station]["time"]
-            and (datetime.utcnow() - results[station]["time"]).total_seconds() > 10
-        ):
-            results[station]["rssi"] = None
+def get_best_rssi_per_location(sensors):
+    """Find the strongest signal in each location."""
+    best_rssi = {}
+    for sensor in sensors.values():
+        location = sensor["location"]
+        rssi = sensor["rssi"]
+        if rssi and (location not in best_rssi or rssi > best_rssi[location]):
+            best_rssi[location] = rssi
+    return best_rssi
 
-    if args.location:
-        # Train the model
-        save_results(args.location)
+
+def get_location(current_location, rssi_per_location):
+    print(f"  Current location: {current_location}, Best RSSI: {rssi_per_location}")
+    try:
+        current_rssi = rssi_per_location[current_location]
+    except KeyError:
+        current_rssi = -110
+    max_rssi = current_rssi
+    for location, rssi in rssi_per_location.items():
+        print(f"  {location}, {rssi}, {max_rssi}")
+        if rssi > max_rssi:
+            max_rssi = rssi
+            new_location = location
+    if max_rssi - current_rssi > config["hysteresis"]:
+        print(f"  New location {new_location}")
+        return new_location
     else:
+        return current_location
+
+
+def remove_stale_rssi(state):
+    """Set rssi to None if no update has been received recently."""
+    for device_id in state:
+        for sensor_id, sensor in state[device_id]["sensors"].items():
+            if (
+                sensor["time"]
+                and (datetime.utcnow() - sensor["time"]).total_seconds()
+                > RSSI_STALE_TIMEOUT
+            ):
+                state[device_id]["sensors"][sensor_id]["rssi"] = None
+    return state
+
+
+def timer_background():
+    """Loop timer for recording or predicting"""
+    global state
+    threading.Timer(0.5, timer_background).start()
+    state = remove_stale_rssi(state)
+    print(state)
+
+    for device_id, device in state.items():
         # Update home/not_home status
-        home_state, has_changed = device_tracker.update(results)
+        home_state, has_changed = device["device_tracker"].update(device["sensors"])
         if has_changed:
             client.publish(
-                f"{SERVICE_NAME}/device_tracker/dale_apple_watch/state",
+                f"{SERVICE_NAME}/device_tracker/{device_id}/state",
                 home_state,
                 qos=1,
                 retain=True,
             )
 
-        # Predict location
-        # location, confidence = knn(config["knn"]["neighbours"])
-        rssi = [
-            results["homepi"]["rssi"],
-            results["upylounge"]["rssi"],
-            results["upybedroom"]["rssi"],
-        ]
-        location, confidence = svm_predictor.predict(rssi)
-
-        if location:
-            print(
-                f"{location}: {int(confidence*100)}% ->",
+        print(f"\nDevice: {device_id}")
+        best_rssi_per_location = get_best_rssi_per_location(device["sensors"])
+        location = get_location(device["debounce"].state, best_rssi_per_location)
+        location, has_changed = device["debounce"].vote(location)
+        print(f"  -> Location: {location}")
+        if location and has_changed:
+            client.publish(
+                f"{SERVICE_NAME}/sensor/{device_id}/state",
+                location,
+                qos=1,
+                retain=True,
             )
-            if confidence > config["knn"]["min_confidence"]:
-                location, has_changed = room_debounce.vote(location)
-                print(f"{room_debounce._history} -> {location}")
-                # TODO unsure whether should publish if there is no location or not...
-                if location and has_changed:
-                    # TODO remove hardcoded device ID
-                    client.publish(
-                        f"{SERVICE_NAME}/sensor/dale_apple_watch/state",
-                        location,
-                        qos=1,
-                        retain=True,
-                    )
+        print("----\n")
 
 
-def publish_timer():
+def timer_publish():
     """Publish the results to MQTT at least once per minute."""
-    threading.Timer(60, publish_timer).start()
-    client.publish(
-        f"{SERVICE_NAME}/sensor/dale_apple_watch/state",
-        room_debounce.state,
-        retain=True,
-    )
-    client.publish(
-        f"{SERVICE_NAME}/device_tracker/dale_apple_watch/state",
-        device_tracker.home_state,
-        retain=True,
-    )
+    threading.Timer(60, timer_publish).start()
+    for device_id, device in state.items():
+        # print(device_id, device["debounce"].state, device["device_tracker"].home_state)
+        client.publish(
+            f"{SERVICE_NAME}/sensor/{device_id}/state",
+            device["debounce"].state,
+            retain=True,
+        )
+        client.publish(
+            f"{SERVICE_NAME}/device_tracker/{device_id}/state",
+            device["device_tracker"].home_state,
+            retain=True,
+        )
 
 
-results = {
-    "upybedroom": {"rssi": None, "time": None},
-    "upylounge": {"rssi": None, "time": None},
-    "homepi": {"rssi": None, "time": None},
-}
+def init_state(config):
+    """Initiate the global state machine."""
+    state = {}
+    for device in config["devices"]:
+        device_id = device["id"]
+        state[device_id] = {
+            "name": device["name"],
+            "debounce": Debounce(length=config["debounce_length"]),
+            "device_tracker": DeviceTracker(device_id),
+            "sensors": {},
+        }
+        for location in config["sensors"]:
+            for sensor_id in config["sensors"][location]:
+                state[device_id]["sensors"][sensor_id] = {
+                    "rssi": None,
+                    "time": None,
+                    "location": location,
+                }
+    return state
 
-room_debounce = Debounce(length=config["debounce_length"])
-device_tracker = DeviceTracker()
 
-X, y = load_data()
-svm_predictor = SVM(X, y)
+config = load_config(args.config_file)
+state = init_state(config)
+
 
 if __name__ == "__main__":
-    materialise_rssi_aggregation()
-
     client = mqtt.Client()
     client.on_connect = mqtt_on_connect
     client.on_message = mqtt_on_message
@@ -393,8 +327,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, on_exit)
     signal.signal(signal.SIGTERM, on_exit)
 
-    background_timer()
-    publish_timer()
+    timer_background()
+    timer_publish()
 
     # Blocking call that processes network traffic, dispatches callbacks and handles reconnecting.
     client.loop_forever()
